@@ -294,6 +294,7 @@ function poseTick() {
 const game = {
   state: 'title',      // title | loading | calibrate | practice | countdown | play | dying | gameover
   practice: { jumped: false, punched: false, doneAt: 0 },
+  calibOkSince: 0,
   usingCamera: false,
   t: 0,
   dist: 0, kills: 0, level: 0,
@@ -439,8 +440,15 @@ function update(dt) {
   if (gesture.punchEvent) { gesture.punchEvent = false; doPunch(); }
 
   if (game.state === 'calibrate') {
-    if (game.usingCamera && gesture.present && performance.now() - gesture.lastSeen < 300) {
-      beginPractice();
+    // require ~1s of stable tracking so the kid sees the green "I can see you!"
+    if (game.usingCamera) {
+      const seen = gesture.present && performance.now() - gesture.lastSeen < 300;
+      if (seen) {
+        if (!game.calibOkSince) game.calibOkSince = game.t;
+        if (game.t - game.calibOkSince > 0.9) beginPractice();
+      } else {
+        game.calibOkSince = 0;
+      }
     }
     return;
   }
@@ -665,8 +673,8 @@ function draw() {
   ctx.globalAlpha = 1;
 
   drawHUD();
-  drawPreview();
   drawScreens();
+  drawPreview();
 }
 
 function drawHills(speedMul, color, extra) {
@@ -798,38 +806,65 @@ function drawHUD() {
   }
 }
 
-/* webcam preview w/ skeleton, bottom-right */
+/* webcam view — big while getting ready, small corner during play */
 const PV_W = 176, PV_H = 132;
+const BONES = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+
+function cameraViewRect() {
+  if (!game.usingCamera || video.readyState < 2) return null;
+  if (game.state === 'calibrate') return { x: W / 2 - 210, y: 170, w: 420, h: 315, big: true };
+  if (game.state === 'practice') return { x: W - 340, y: 200, w: 320, h: 240, big: true };
+  return { x: W - PV_W - 14, y: H - PV_H - 14, w: PV_W, h: PV_H, big: false };
+}
+
 function drawPreview() {
-  if (!game.usingCamera || video.readyState < 2) return;
-  const px = W - PV_W - 14, py = H - PV_H - 14;
+  const r = cameraViewRect();
+  if (!r) return;
+  const { x: px, y: py, w: pw, h: ph, big } = r;
   ctx.save();
-  // border flashes with detected moves
-  let border = '#fff';
-  if (game.t < game.flash.jump) border = '#39e639';
+  // border flashes with detected moves; green = tracked, red = lost
+  let border = gesture.present ? '#39e639' : '#ff5252';
+  if (game.t < game.flash.jump) border = '#7CFC00';
   else if (game.t < game.flash.punch) border = '#ffb300';
-  else if (!gesture.present) border = '#ff5252';
-  ctx.strokeStyle = border; ctx.lineWidth = 4;
-  roundRect(px - 2, py - 2, PV_W + 4, PV_H + 4, 10); ctx.stroke();
-  roundRect(px, py, PV_W, PV_H, 8); ctx.clip();
+  ctx.strokeStyle = border; ctx.lineWidth = big ? 6 : 4;
+  roundRect(px - 3, py - 3, pw + 6, ph + 6, 12); ctx.stroke();
+  roundRect(px, py, pw, ph, 10); ctx.clip();
   // mirrored video
-  ctx.translate(px + PV_W, py); ctx.scale(-1, 1);
-  ctx.drawImage(video, 0, 0, PV_W, PV_H);
-  // landmarks
+  ctx.translate(px + pw, py); ctx.scale(-1, 1);
+  ctx.drawImage(video, 0, 0, pw, ph);
+  // skeleton overlay
   if (latestLandmarks) {
+    ctx.strokeStyle = 'rgba(57,230,57,.85)'; ctx.lineWidth = big ? 4 : 2;
+    for (const [a, b] of BONES) {
+      const la = latestLandmarks[a], lb = latestLandmarks[b];
+      if (la && lb && vis(la) > 0.4 && vis(lb) > 0.4) {
+        ctx.beginPath();
+        ctx.moveTo(la.x * pw, la.y * ph);
+        ctx.lineTo(lb.x * pw, lb.y * ph);
+        ctx.stroke();
+      }
+    }
     ctx.fillStyle = '#39e639';
     for (const i of [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]) {
       const lm = latestLandmarks[i];
       if (lm && vis(lm) > 0.4) {
-        ctx.beginPath(); ctx.arc(lm.x * PV_W, lm.y * PV_H, 3, 0, 7); ctx.fill();
+        ctx.beginPath(); ctx.arc(lm.x * pw, lm.y * ph, big ? 6 : 3, 0, 7); ctx.fill();
       }
     }
   }
   ctx.restore();
-  if (!gesture.present) {
-    ctx.textAlign = 'center';
+  // status label
+  ctx.textAlign = 'center';
+  if (big) {
+    ctx.font = 'bold 24px "Comic Sans MS", sans-serif';
+    ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(0,0,0,.6)';
+    const msg = gesture.present ? '✅ I can see you!' : '🔍 I can\'t see your whole body…';
+    ctx.fillStyle = gesture.present ? '#7CFC00' : '#ff8080';
+    ctx.strokeText(msg, px + pw / 2, py + ph + 34);
+    ctx.fillText(msg, px + pw / 2, py + ph + 34);
+  } else if (!gesture.present) {
     ctx.font = 'bold 13px sans-serif'; ctx.fillStyle = '#ff5252';
-    ctx.fillText('Can\'t see you!', px + PV_W / 2, py - 8);
+    ctx.fillText('Can\'t see you!', px + pw / 2, py - 8);
   }
 }
 
@@ -838,10 +873,9 @@ function drawScreens() {
   ctx.textAlign = 'center';
   if (game.state === 'calibrate') {
     dimBox();
-    bigText('📸 Stand back!', H / 2 - 40);
-    midText('Move back until the camera can see', H / 2 + 10);
-    midText('your head AND your hips 🙆', H / 2 + 44);
-    if (!game.usingCamera) midText('(or press Space to start with keyboard)', H / 2 + 90);
+    bigText('📸 Stand back!', 70);
+    midText('Move back until the camera can see your head AND your hips 🙆', 120);
+    if (!game.usingCamera) midText('No camera found — starting keyboard mode… (Space = jump, P = punch)', H / 2 + 60);
   } else if (game.state === 'practice') {
     // warm-up checklist panel at the top — character stays visible below
     ctx.fillStyle = 'rgba(10,5,40,.72)';
@@ -864,7 +898,7 @@ function drawScreens() {
       ctx.font = 'bold 18px "Comic Sans MS", sans-serif';
       ctx.fillStyle = 'rgba(255,255,255,.85)';
       const hint = game.usingCamera
-        ? 'Jump and punch for real — watch the little screen see you move!'
+        ? 'Jump and punch for real — the camera is watching you! 👉'
         : 'Space = jump, P = punch';
       ctx.lineWidth = 4;
       ctx.strokeText(hint, W / 2, 166); ctx.fillText(hint, W / 2, 166);

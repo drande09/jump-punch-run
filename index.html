@@ -292,7 +292,8 @@ function poseTick() {
 
 /* ---------------- Game state ---------------- */
 const game = {
-  state: 'title',      // title | loading | calibrate | countdown | play | dying | gameover
+  state: 'title',      // title | loading | calibrate | practice | countdown | play | dying | gameover
+  practice: { jumped: false, punched: false, doneAt: 0 },
   usingCamera: false,
   t: 0,
   dist: 0, kills: 0, level: 0,
@@ -331,21 +332,34 @@ function resetRun() {
 }
 
 function doJump() {
-  if (game.state === 'play' && player.onGround && !player.falling) {
+  if ((game.state === 'play' || game.state === 'practice') && player.onGround && !player.falling) {
     player.vy = -JUMP_V;
     player.onGround = false;
     sfx.jump();
     game.flash.jump = game.t + 0.35;
+    if (game.state === 'practice' && !game.practice.jumped) {
+      game.practice.jumped = true;
+      floater(PLAYER_X + 30, player.y - 120, 'GREAT JUMP! ✅', '#7CFC00');
+    }
   } else if (game.state === 'gameover') {
     beginCountdown();
   }
 }
 function doPunch() {
-  if (game.state !== 'play' || player.falling) return;
+  if ((game.state !== 'play' && game.state !== 'practice') || player.falling) return;
   player.punchUntil = game.t * 1000 + 500;
   sfx.punch();
   game.flash.punch = game.t + 0.35;
   spawnParticles(PLAYER_X + 70, player.y - 55, '#ffd944', 6);
+  if (game.state === 'practice' && !game.practice.punched) {
+    game.practice.punched = true;
+    floater(PLAYER_X + 60, player.y - 90, 'SUPER PUNCH! ✅', '#ffd944');
+  }
+}
+
+function beginPractice() {
+  game.practice = { jumped: false, punched: false, doneAt: 0 };
+  game.state = 'practice';
 }
 
 addEventListener('keydown', (e) => {
@@ -426,8 +440,34 @@ function update(dt) {
 
   if (game.state === 'calibrate') {
     if (game.usingCamera && gesture.present && performance.now() - gesture.lastSeen < 300) {
-      beginCountdown();
+      beginPractice();
     }
+    return;
+  }
+
+  if (game.state === 'practice') {
+    // player physics only — the world stands still while warming up
+    if (!player.onGround) {
+      player.vy += GRAVITY * dt;
+      player.y += player.vy * dt;
+      if (player.y >= GROUND_Y) { player.y = GROUND_Y; player.vy = 0; player.onGround = true; }
+    }
+    player.runPhase += dt * 4;
+    for (let i = game.particles.length - 1; i >= 0; i--) {
+      const p = game.particles[i];
+      p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt;
+      if (p.life <= 0) game.particles.splice(i, 1);
+    }
+    for (let i = game.floaters.length - 1; i >= 0; i--) {
+      const f = game.floaters[i];
+      f.life -= dt * 0.6; f.y -= 40 * dt;
+      if (f.life <= 0) game.floaters.splice(i, 1);
+    }
+    if (game.practice.jumped && game.practice.punched && !game.practice.doneAt) {
+      game.practice.doneAt = game.t + 1.5;
+      sfx.level();
+    }
+    if (game.practice.doneAt && game.t > game.practice.doneAt) beginCountdown();
     return;
   }
 
@@ -733,7 +773,7 @@ function roundRect(x, y, w, h, r) {
 }
 
 function drawHUD() {
-  if (game.state === 'title' || game.state === 'loading') return;
+  if (!['countdown', 'play', 'dying', 'gameover'].includes(game.state)) return;
   ctx.textAlign = 'left';
   ctx.font = 'bold 34px "Comic Sans MS", sans-serif';
   ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(0,0,0,.45)'; ctx.lineWidth = 6;
@@ -802,6 +842,33 @@ function drawScreens() {
     midText('Move back until the camera can see', H / 2 + 10);
     midText('your head AND your hips 🙆', H / 2 + 44);
     if (!game.usingCamera) midText('(or press Space to start with keyboard)', H / 2 + 90);
+  } else if (game.state === 'practice') {
+    // warm-up checklist panel at the top — character stays visible below
+    ctx.fillStyle = 'rgba(10,5,40,.72)';
+    roundRect(W / 2 - 330, 16, 660, 168, 20); ctx.fill();
+    ctx.strokeStyle = '#ffd944'; ctx.lineWidth = 4;
+    roundRect(W / 2 - 330, 16, 660, 168, 20); ctx.stroke();
+    if (game.practice.doneAt) {
+      bigText('YOU\'RE READY! 🎉', 92);
+      midText('Here we go…', 150);
+    } else {
+      bigText('Warm up! 💪', 74);
+      ctx.font = 'bold 30px "Comic Sans MS", sans-serif';
+      ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.lineWidth = 6;
+      const j = `${game.practice.jumped ? '✅' : '⬜'} 🦘 Do a JUMP!`;
+      const p = `${game.practice.punched ? '✅' : '⬜'} 👊 Do a PUNCH!`;
+      ctx.fillStyle = game.practice.jumped ? '#7CFC00' : '#fff';
+      ctx.strokeText(j, W / 2 - 165, 128); ctx.fillText(j, W / 2 - 165, 128);
+      ctx.fillStyle = game.practice.punched ? '#7CFC00' : '#fff';
+      ctx.strokeText(p, W / 2 + 165, 128); ctx.fillText(p, W / 2 + 165, 128);
+      ctx.font = 'bold 18px "Comic Sans MS", sans-serif';
+      ctx.fillStyle = 'rgba(255,255,255,.85)';
+      const hint = game.usingCamera
+        ? 'Jump and punch for real — watch the little screen see you move!'
+        : 'Space = jump, P = punch';
+      ctx.lineWidth = 4;
+      ctx.strokeText(hint, W / 2, 166); ctx.fillText(hint, W / 2, 166);
+    }
   } else if (game.state === 'countdown') {
     const remain = Math.max(game.countdownEnd - game.t, 0);
     const n = Math.ceil(remain);
@@ -860,7 +927,7 @@ function loop(t) {
 requestAnimationFrame(loop);
 
 // debug/test hook (harmless in production)
-window.__jpr = { game, player, gesture, update, draw, doJump, doPunch, beginCountdown, score };
+window.__jpr = { game, player, gesture, update, draw, doJump, doPunch, beginCountdown, beginPractice, score };
 
 /* ---------------- Boot flow ---------------- */
 document.getElementById('startBtn').addEventListener('click', async () => {
@@ -886,7 +953,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   } else {
     // keyboard fallback — still fully playable
     game.state = 'calibrate';
-    setTimeout(() => { if (game.state === 'calibrate') beginCountdown(); }, 2500);
+    setTimeout(() => { if (game.state === 'calibrate') beginPractice(); }, 2500);
   }
 });
 </script>

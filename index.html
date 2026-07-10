@@ -72,6 +72,26 @@
   button:active { transform: translateY(4px); box-shadow: 0 2px 0 #b36b00; }
   .tiny { font-size: 13px; opacity: .75; margin-top: 14px; }
   #err { color: #ff9b9b; font-size: 15px; margin-top: 12px; display: none; }
+  #dressPanel { max-width: 460px; padding: 22px 30px; margin-left: 24%; }
+  .dress-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+  .dress-row > span { width: 62px; text-align: right; font-weight: bold; font-size: 16px; flex-shrink: 0; }
+  .dress-row > div { display: flex; flex-wrap: wrap; align-items: center; }
+  .swatch {
+    width: 34px; height: 34px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.25);
+    padding: 0; margin: 3px; cursor: pointer; box-shadow: none;
+  }
+  .swatch.sel { border-color: #ffd944; transform: scale(1.18); }
+  .mini {
+    font-size: 15px; padding: 8px 12px; border-radius: 14px;
+    box-shadow: none; background: #3a2d6e; color: #fff; margin: 3px;
+  }
+  .mini.sel { background: linear-gradient(#ffe066, #ffb300); color: #3a1a00; }
+  #dressDone { font-size: 20px; padding: 12px 32px; margin-top: 10px; }
+  #newPlayerBtn {
+    position: absolute; left: 50%; transform: translateX(-50%); bottom: 7%;
+    font-size: 18px; padding: 12px 26px; z-index: 6;
+  }
   .hidden { display: none !important; }
   #spin {
     width: 54px; height: 54px; margin: 18px auto 6px;
@@ -107,7 +127,22 @@
     <div class="sub" id="loadMsg">Turning on the camera magic 🪄</div>
     <div id="spin"></div>
   </div>
+  <div class="panel hidden" id="dressPanel">
+    <h1 style="font-size:30px">🎨 Make your hero!</h1>
+    <div class="sub" style="font-size:14px">The camera guessed your colors — tap to change them!</div>
+    <div class="dress-row"><span>Hair</span><div id="hairSwatches"></div></div>
+    <div class="dress-row"><span>Style</span><div id="styleBtns">
+      <button class="mini" data-style="short">✂️ Short</button>
+      <button class="mini" data-style="long">💇 Long</button>
+      <button class="mini" data-style="spiky">⚡ Spiky</button>
+      <button class="mini" data-style="curly">🌀 Curly</button>
+    </div></div>
+    <div class="dress-row"><span>Shirt</span><div id="shirtSwatches"></div></div>
+    <div class="dress-row"><span>Pants</span><div id="pantsSwatches"></div></div>
+    <button id="dressDone">✅ LET'S GO!</button>
+  </div>
 </div>
+<button id="newPlayerBtn" class="hidden">🔄 New player</button>
 
 <script type="module">
 /* ============================================================
@@ -183,7 +218,7 @@ const gesture = {
   cfg: { ...DEFAULT_CFG },
   calib: null,           // { mode, win, jumpSamples, punchSamples } while calibrating
   // internals
-  baseline: null, jumpArmed: true, prevHipY: null, upVel: 0, lastJumpT: 0,
+  baseline: null, jumpArmed: true, prevHipY: null, upVel: 0, lastJumpT: 0, liftedSince: 0,
   prevRel: null, prevT: 0, wristSpeed: { l: 0, r: 0 },
   extArmed: { l: true, r: true }, lastPunchT: 0,
 };
@@ -210,7 +245,9 @@ function updateGestures(lm, tNow) {
          The velocity path fires early in the ascent = low latency. --- */
   const cfg = gesture.cfg;
   const hipY = hip.y;
-  if (gesture.baseline === null) gesture.baseline = hipY;
+  if (!Number.isFinite(hipY) || !Number.isFinite(torso)) return;
+  if (gesture.baseline === null || !Number.isFinite(gesture.baseline)) gesture.baseline = hipY;
+  if (!Number.isFinite(gesture.upVel)) gesture.upVel = 0;
   const liftT = (gesture.baseline - hipY) / torso;   // + means body moved UP, in torso units
   const rawUpVel = gesture.prevHipY !== null ? (gesture.prevHipY - hipY) / Math.max(dt, 0.01) / torso : 0;
   gesture.upVel = gesture.upVel * 0.45 + rawUpVel * 0.55;
@@ -218,6 +255,17 @@ function updateGestures(lm, tNow) {
   if (liftT < 0.15) {
     // only track baseline while roughly grounded
     gesture.baseline += (hipY - gesture.baseline) * Math.min(1, dt * 2.2);
+    gesture.liftedSince = 0;
+  } else {
+    // ESCAPE HATCH: nobody hangs in the air for over a second. If the body
+    // reads as "lifted" that long, the baseline is stale (player crouched or
+    // sat down earlier, then stood up) — snap it to the current pose so jump
+    // detection can never deadlock.
+    if (!gesture.liftedSince) gesture.liftedSince = tNow;
+    if (tNow - gesture.liftedSince > 1100) {
+      gesture.baseline = hipY;
+      gesture.liftedSince = 0;
+    }
   }
   if (gesture.jumpArmed &&
       (liftT > cfg.lift || (gesture.upVel > cfg.jumpVel && liftT > cfg.lift * 0.45))) {
@@ -295,8 +343,9 @@ function finishCalibration() {
   gesture.cfg = { ...DEFAULT_CFG };
   if (c) {
     if (c.jumpSamples.length >= 2) {
-      gesture.cfg.lift = clampN(median(c.jumpSamples.map(s => s.lift)) * 0.55, 0.10, 0.26);
-      gesture.cfg.jumpVel = clampN(median(c.jumpSamples.map(s => s.vel)) * 0.5, 0.9, 2.0);
+      // warm-up jumps are showcase-big; in-game hops are smaller — aim low
+      gesture.cfg.lift = clampN(median(c.jumpSamples.map(s => s.lift)) * 0.45, 0.10, 0.20);
+      gesture.cfg.jumpVel = clampN(median(c.jumpSamples.map(s => s.vel)) * 0.45, 0.8, 1.6);
     }
     if (c.punchSamples.length >= 2) {
       gesture.cfg.punchSpeed = clampN(median(c.punchSamples) * 0.55, 1.7, 3.0);
@@ -380,8 +429,9 @@ const player = {
   y: GROUND_Y, vy: 0, onGround: true,
   punchUntil: 0, runPhase: 0, falling: false,
   // painted from the webcam during setup so the hero looks like the player
-  look: { skin: '#ffcc99', hair: '#5a3410', shirt: '#e0501e', pants: '#2b4bd7' },
+  look: { skin: '#ffcc99', hair: '#5a3410', shirt: '#e0501e', pants: '#2b4bd7', hairStyle: 'short' },
 };
+try { Object.assign(player.look, JSON.parse(localStorage.getItem('jpr-look') || '{}')); } catch (e) {}
 
 /* ---- sample the player's real colors from the video frame ---- */
 const sampleCvs = document.createElement('canvas');
@@ -496,9 +546,75 @@ function beginPractice() {
   // extra-generous thresholds while we learn how big this player's moves are
   gesture.cfg = { lift: 0.15, jumpVel: 1.2, punchSpeed: 2.5, ext: 1.15 };
   gesture.calib = { mode: 'jump', win: null, jumpSamples: [], punchSamples: [] };
-  if (game.usingCamera) sampleLook();   // paint the hero with the player's colors
   game.state = 'practice';
 }
+
+/* ---------------- Character setup (dress-up) ---------------- */
+const dressPanel = document.getElementById('dressPanel');
+const newPlayerBtn = document.getElementById('newPlayerBtn');
+const HAIR_COLORS = ['#141414', '#3d2314', '#6b4423', '#a06a2c', '#d9a441', '#f2d16b', '#b5451f', '#9e9e9e'];
+const CLOTH_COLORS = ['#e0501e', '#2b6df2', '#27ae60', '#e91e8c', '#f5c518', '#8e44ad', '#17a2b8', '#f8f9fa', '#212529'];
+
+function buildSwatches(el, colors, current, onPick) {
+  el.innerHTML = '';
+  const all = [current, ...colors.filter(c => c !== current)];
+  all.forEach((c, idx) => {
+    const b = document.createElement('button');
+    b.className = 'swatch' + (idx === 0 ? ' sel' : '');
+    b.style.background = c;
+    b.title = idx === 0 ? 'From the camera 📸' : '';
+    b.onclick = () => {
+      onPick(c);
+      [...el.children].forEach(x => x.classList.remove('sel'));
+      b.classList.add('sel');
+    };
+    el.appendChild(b);
+  });
+}
+
+function beginDressing() {
+  // stand the hero back up (they may have fallen in a hole last round)
+  player.y = GROUND_Y; player.vy = 0; player.onGround = true;
+  player.falling = false; player.punchUntil = 0;
+  if (game.usingCamera) sampleLook();   // auto-detect the player's colors first
+  buildSwatches(document.getElementById('hairSwatches'), HAIR_COLORS, player.look.hair, c => player.look.hair = c);
+  buildSwatches(document.getElementById('shirtSwatches'), CLOTH_COLORS, player.look.shirt, c => player.look.shirt = c);
+  buildSwatches(document.getElementById('pantsSwatches'), CLOTH_COLORS, player.look.pants, c => player.look.pants = c);
+  const styleWrap = document.getElementById('styleBtns');
+  [...styleWrap.children].forEach(b => {
+    b.classList.toggle('sel', b.dataset.style === player.look.hairStyle);
+    b.onclick = () => {
+      player.look.hairStyle = b.dataset.style;
+      [...styleWrap.children].forEach(x => x.classList.remove('sel'));
+      b.classList.add('sel');
+    };
+  });
+  overlay.style.display = '';
+  dressPanel.classList.remove('hidden');
+  game.state = 'dress';
+}
+
+document.getElementById('dressDone').addEventListener('click', () => {
+  dressPanel.classList.add('hidden');
+  overlay.style.display = 'none';
+  try { localStorage.setItem('jpr-look', JSON.stringify(player.look)); } catch (e) {}
+  beginPractice();
+});
+
+function resetGesture() {
+  gesture.baseline = null; gesture.prevHipY = null; gesture.upVel = 0;
+  gesture.prevRel = null; gesture.jumpArmed = true; gesture.liftedSince = 0;
+  gesture.jumpEvent = false; gesture.punchEvent = false;
+  gesture.cfg = { ...DEFAULT_CFG };
+}
+
+newPlayerBtn.addEventListener('click', () => {
+  newPlayerBtn.classList.add('hidden');
+  resetGesture();
+  game.calibOkSince = 0;
+  if (game.usingCamera) game.state = 'calibrate';
+  else beginDressing();
+});
 
 addEventListener('keydown', (e) => {
   if (e.repeat) return;
@@ -579,6 +695,7 @@ function die(reason) {
 
 function beginCountdown() {
   resetRun();
+  newPlayerBtn.classList.add('hidden');
   game.state = 'countdown';
   game.countdownEnd = game.t + 3.2;
 }
@@ -597,11 +714,16 @@ function update(dt) {
       const seen = gesture.present && performance.now() - gesture.lastSeen < 300;
       if (seen) {
         if (!game.calibOkSince) game.calibOkSince = game.t;
-        if (game.t - game.calibOkSince > 0.9) beginPractice();
+        if (game.t - game.calibOkSince > 0.9) beginDressing();
       } else {
         game.calibOkSince = 0;
       }
     }
+    return;
+  }
+
+  if (game.state === 'dress') {
+    player.runPhase += dt * 2;   // gentle idle animation while dressing up
     return;
   }
 
@@ -645,6 +767,7 @@ function update(dt) {
     player.y += player.falling ? 260 * dt : Math.sin(game.dieAnimT * 10) * 2;
     if (game.dieAnimT > 1.1) {
       game.state = 'gameover';
+      newPlayerBtn.classList.remove('hidden');
       const s = score();
       if (s > game.best) { game.best = s; localStorage.setItem('jpr-best', s); }
     }
@@ -938,6 +1061,7 @@ function drawPlayer() {
 
   ctx.save();
   ctx.translate(x, footY);
+  if (game.state === 'dress') ctx.scale(2.1, 2.1);   // big preview while dressing up
   if (dead) ctx.rotate(Math.min(game.dieAnimT * 3, Math.PI / 2));
 
   const legSwing = player.onGround && !dead ? Math.sin(player.runPhase) : 0.3;
@@ -953,6 +1077,11 @@ function drawPlayer() {
   ctx.beginPath(); ctx.ellipse(-8 + legSwing * 18, 0, 10, 5, 0, 0, 7); ctx.fill();
   ctx.beginPath(); ctx.ellipse(12 - legSwing * 18, 0, 10, 5, 0, 0, 7); ctx.fill();
 
+  // long hair: flowing mass BEHIND the body, peeking out at the sides
+  if (look.hairStyle === 'long') {
+    ctx.fillStyle = look.hair;
+    roundRect(-22, -96, 44, 54, 16); ctx.fill();
+  }
   // body
   ctx.fillStyle = look.shirt;
   roundRect(-16, -66, 32, 36, 10); ctx.fill();
@@ -984,9 +1113,24 @@ function drawPlayer() {
   // head
   ctx.fillStyle = look.skin;
   ctx.beginPath(); ctx.arc(0, -82, 15, 0, 7); ctx.fill();
-  // hair
+  // hair on top, by style
   ctx.fillStyle = look.hair;
-  ctx.beginPath(); ctx.arc(0, -87, 14, Math.PI, 0); ctx.fill();
+  if (look.hairStyle === 'spiky') {
+    ctx.beginPath();
+    ctx.moveTo(-15, -85);
+    for (let sp = 0; sp < 5; sp++) {
+      ctx.lineTo(-15 + sp * 7.5 + 3.75, -102 - (sp % 2) * 4);
+      ctx.lineTo(-15 + (sp + 1) * 7.5, -85);
+    }
+    ctx.closePath(); ctx.fill();
+  } else if (look.hairStyle === 'curly') {
+    for (const [hx, hy, hr] of [[-12, -89, 6], [-6, -95, 6.5], [1, -97, 7], [8, -94, 6.5], [13, -88, 6]]) {
+      ctx.beginPath(); ctx.arc(hx, hy, hr, 0, 7); ctx.fill();
+    }
+  } else {
+    // short cap (long style also gets the cap so the hairline looks right)
+    ctx.beginPath(); ctx.arc(0, -87, 14, Math.PI, 0); ctx.fill();
+  }
   // face
   ctx.fillStyle = '#222';
   const eyeY = -84;
@@ -1207,7 +1351,7 @@ function loop(t) {
 requestAnimationFrame(loop);
 
 // debug/test hook (harmless in production)
-window.__jpr = { game, player, gesture, update, draw, doJump, doPunch, beginCountdown, beginPractice, finishCalibration, score };
+window.__jpr = { game, player, gesture, update, draw, doJump, doPunch, beginCountdown, beginPractice, finishCalibration, updateGestures, score };
 
 /* ---------------- Boot flow ---------------- */
 document.getElementById('startBtn').addEventListener('click', async () => {
@@ -1233,7 +1377,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   } else {
     // keyboard fallback — still fully playable
     game.state = 'calibrate';
-    setTimeout(() => { if (game.state === 'calibrate') beginPractice(); }, 2500);
+    setTimeout(() => { if (game.state === 'calibrate') beginDressing(); }, 2500);
   }
 });
 </script>

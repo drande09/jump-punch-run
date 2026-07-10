@@ -891,7 +891,8 @@ function cameraViewRect() {
   if (!game.usingCamera || video.readyState < 2) return null;
   if (game.state === 'calibrate') return { x: W / 2 - 210, y: 170, w: 420, h: 315, big: true };
   if (game.state === 'practice') return { x: W - 340, y: 200, w: 320, h: 240, big: true };
-  return { x: W - PV_W - 14, y: H - PV_H - 14, w: PV_W, h: PV_H, big: false };
+  // upper-right during play so it never covers incoming obstacles
+  return { x: W - PV_W - 14, y: 14, w: PV_W, h: PV_H, big: false };
 }
 
 function drawPreview() {
@@ -941,7 +942,7 @@ function drawPreview() {
     ctx.fillText(msg, px + pw / 2, py + ph + 34);
   } else if (!gesture.present) {
     ctx.font = 'bold 13px sans-serif'; ctx.fillStyle = '#ff5252';
-    ctx.fillText('Can\'t see you!', px + pw / 2, py - 8);
+    ctx.fillText('Can\'t see you!', px + pw / 2, py + ph + 18);
   }
 }
 

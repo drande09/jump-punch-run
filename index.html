@@ -172,13 +172,17 @@ const sfx = {
 };
 
 /* ---------------- Gesture detection from pose ---------------- */
+const DEFAULT_CFG = { lift: 0.22, jumpVel: 1.5, punchSpeed: 3.0, ext: 1.2 };
 const gesture = {
   present: false,        // is a person visible right now
   lastSeen: 0,           // performance.now() of last good pose
   jumpEvent: false,      // one-shot flags, consumed by game
   punchEvent: false,
+  // detection thresholds — personalized during the warm-up calibration
+  cfg: { ...DEFAULT_CFG },
+  calib: null,           // { mode, win, jumpSamples, punchSamples } while calibrating
   // internals
-  baseline: null, jumpArmed: true, offGround: 0,
+  baseline: null, jumpArmed: true, prevHipY: null, upVel: 0,
   prevWrists: null, prevT: 0, wristSpeed: { l: 0, r: 0 },
   extArmed: { l: true, r: true }, lastPunchT: 0,
 };
@@ -201,19 +205,28 @@ function updateGestures(lm, tNow) {
   const dt = gesture.prevT ? Math.min((tNow - gesture.prevT) / 1000, 0.2) : 0.033;
   gesture.prevT = tNow;
 
-  /* --- JUMP: hips rise sharply above a slow-moving baseline --- */
+  /* --- JUMP: hips rise above a slow baseline, OR shoot upward fast.
+         The velocity path fires early in the ascent = low latency. --- */
+  const cfg = gesture.cfg;
   const hipY = hip.y;
   if (gesture.baseline === null) gesture.baseline = hipY;
-  const lift = gesture.baseline - hipY;            // + means body moved UP
-  if (lift < 0.15 * torso) {
+  const liftT = (gesture.baseline - hipY) / torso;   // + means body moved UP, in torso units
+  const rawUpVel = gesture.prevHipY !== null ? (gesture.prevHipY - hipY) / Math.max(dt, 0.01) / torso : 0;
+  gesture.upVel = gesture.upVel * 0.45 + rawUpVel * 0.55;
+  gesture.prevHipY = hipY;
+  if (liftT < 0.15) {
     // only track baseline while roughly grounded
     gesture.baseline += (hipY - gesture.baseline) * Math.min(1, dt * 2.2);
   }
-  if (gesture.jumpArmed && lift > 0.27 * torso) {
+  if (gesture.jumpArmed &&
+      (liftT > cfg.lift || (gesture.upVel > cfg.jumpVel && liftT > cfg.lift * 0.45))) {
     gesture.jumpEvent = true;
     gesture.jumpArmed = false;
+    if (gesture.calib && gesture.calib.mode === 'jump' && !gesture.calib.win) {
+      gesture.calib.win = { type: 'jump', until: tNow + 800, peakLift: liftT, peakVel: gesture.upVel };
+    }
   }
-  if (!gesture.jumpArmed && lift < 0.1 * torso) gesture.jumpArmed = true;
+  if (!gesture.jumpArmed && liftT < Math.min(0.1, cfg.lift * 0.5)) gesture.jumpArmed = true;
 
   /* --- PUNCH: fast wrist snap OR arm thrown out to the side --- */
   const shoulderW = Math.max(Math.abs(ls.x - rs.x), torso * 0.55);
@@ -229,18 +242,57 @@ function updateGestures(lm, tNow) {
       const ext = Math.abs(w.x - sLm.x) / shoulderW;             // lateral arm extension
       const nearShoulderLevel = Math.abs(w.y - sLm.y) < torso * 1.0;
       const aboveHips = w.y < hip.y + torso * 0.2;
-      const cooled = tNow - gesture.lastPunchT > 350;
-      const fastSnap = gesture.wristSpeed[side] > 3.2 && aboveHips;
-      const armOut = ext > 1.2 && nearShoulderLevel && gesture.extArmed[side];
+      const cooled = tNow - gesture.lastPunchT > 300;
+      const fastSnap = gesture.wristSpeed[side] > cfg.punchSpeed && aboveHips;
+      const armOut = ext > cfg.ext && nearShoulderLevel && gesture.extArmed[side];
       if (cooled && (fastSnap || armOut)) {
         gesture.punchEvent = true;
         gesture.lastPunchT = tNow;
         gesture.extArmed[side] = false;
+        if (gesture.calib && gesture.calib.mode === 'punch' && !gesture.calib.win) {
+          gesture.calib.win = { type: 'punch', until: tNow + 350, peak: gesture.wristSpeed[side] };
+        }
       }
       if (ext < 0.8) gesture.extArmed[side] = true;
     }
   }
   gesture.prevWrists = wrists;
+
+  // calibration: record how BIG this player's moves actually are
+  const c = gesture.calib;
+  if (c && c.win) {
+    if (tNow < c.win.until) {
+      if (c.win.type === 'jump') {
+        c.win.peakLift = Math.max(c.win.peakLift, liftT);
+        c.win.peakVel = Math.max(c.win.peakVel, gesture.upVel);
+      } else {
+        c.win.peak = Math.max(c.win.peak, gesture.wristSpeed.l, gesture.wristSpeed.r);
+      }
+    } else {
+      if (c.win.type === 'jump') c.jumpSamples.push({ lift: c.win.peakLift, vel: c.win.peakVel });
+      else c.punchSamples.push(c.win.peak);
+      c.win = null;
+    }
+  }
+}
+
+function median(arr) { const s = [...arr].sort((a, b) => a - b); return s[(s.length - 1) >> 1]; }
+function clampN(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
+
+/* set personal thresholds at ~55% of the player's measured move size */
+function finishCalibration() {
+  const c = gesture.calib;
+  gesture.cfg = { ...DEFAULT_CFG };
+  if (c) {
+    if (c.jumpSamples.length >= 2) {
+      gesture.cfg.lift = clampN(median(c.jumpSamples.map(s => s.lift)) * 0.55, 0.10, 0.26);
+      gesture.cfg.jumpVel = clampN(median(c.jumpSamples.map(s => s.vel)) * 0.5, 0.9, 2.0);
+    }
+    if (c.punchSamples.length >= 2) {
+      gesture.cfg.punchSpeed = clampN(median(c.punchSamples) * 0.55, 1.7, 3.0);
+    }
+  }
+  gesture.calib = null;
 }
 
 /* ---------------- Pose engine (MediaPipe) ---------------- */
@@ -269,7 +321,7 @@ async function loadPose() {
 
 async function startCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user', frameRate: { ideal: 60 } },
     audio: false,
   });
   video.srcObject = stream;
@@ -293,7 +345,7 @@ function poseTick() {
 /* ---------------- Game state ---------------- */
 const game = {
   state: 'title',      // title | loading | calibrate | practice | countdown | play | dying | gameover
-  practice: { jumped: false, punched: false, doneAt: 0 },
+  practice: { phase: 'jump', count: 0, doneAt: 0 },
   calibOkSince: 0,
   usingCamera: false,
   t: 0,
@@ -338,9 +390,15 @@ function doJump() {
     player.onGround = false;
     sfx.jump();
     game.flash.jump = game.t + 0.35;
-    if (game.state === 'practice' && !game.practice.jumped) {
-      game.practice.jumped = true;
-      floater(PLAYER_X + 30, player.y - 120, 'GREAT JUMP! ✅', '#7CFC00');
+    if (game.state === 'practice' && !game.practice.doneAt && game.practice.phase === 'jump') {
+      const pr = game.practice;
+      pr.count++;
+      floater(PLAYER_X + 30, player.y - 120, `JUMP ${pr.count}/3 ✅`, '#7CFC00');
+      if (pr.count >= 3) {
+        pr.phase = 'punch'; pr.count = 0;
+        if (gesture.calib) gesture.calib.mode = 'punch';
+        sfx.level();
+      }
     }
   } else if (game.state === 'gameover') {
     beginCountdown();
@@ -352,14 +410,22 @@ function doPunch() {
   sfx.punch();
   game.flash.punch = game.t + 0.35;
   spawnParticles(PLAYER_X + 70, player.y - 55, '#ffd944', 6);
-  if (game.state === 'practice' && !game.practice.punched) {
-    game.practice.punched = true;
-    floater(PLAYER_X + 60, player.y - 90, 'SUPER PUNCH! ✅', '#ffd944');
+  if (game.state === 'practice' && !game.practice.doneAt && game.practice.phase === 'punch') {
+    const pr = game.practice;
+    pr.count++;
+    floater(PLAYER_X + 60, player.y - 90, `PUNCH ${pr.count}/3 ✅`, '#ffd944');
+    if (pr.count >= 3) {
+      pr.doneAt = game.t + 1.6;   // finishCalibration runs at countdown, after the last sample settles
+      sfx.level();
+    }
   }
 }
 
 function beginPractice() {
-  game.practice = { jumped: false, punched: false, doneAt: 0 };
+  game.practice = { phase: 'jump', count: 0, doneAt: 0 };
+  // extra-generous thresholds while we learn how big this player's moves are
+  gesture.cfg = { lift: 0.15, jumpVel: 1.2, punchSpeed: 2.5, ext: 1.15 };
+  gesture.calib = { mode: 'jump', win: null, jumpSamples: [], punchSamples: [] };
   game.state = 'practice';
 }
 
@@ -386,7 +452,7 @@ function spawn() {
     const n = lvl >= 3 && Math.random() < 0.35 ? 2 : 1;   // enemy pairs at higher levels
     for (let i = 0; i < n; i++) {
       game.entities.push({
-        type: 'enemy', x: x + i * 95, w: 52, h: 56,
+        type: 'enemy', x: x + i * 95, w: 56, h: 64,
         face: ENEMY_FACES[(Math.random() * ENEMY_FACES.length) | 0],
         vx: 40 + lvl * 12 + Math.random() * 20, bob: Math.random() * 6,
       });
@@ -395,7 +461,7 @@ function spawn() {
     const w = Math.min(68 + lvl * 9 + Math.random() * 32, 160);
     game.entities.push({ type: 'hole', x, w });
   } else {
-    const h = Math.min(32 + Math.random() * 22 + lvl * 4, 78);
+    const h = Math.min(38 + Math.random() * 22 + lvl * 4, 80);
     game.entities.push({
       type: 'obstacle', x, w: 46 + Math.random() * 16, h,
       face: OBSTACLE_FACES[(Math.random() * OBSTACLE_FACES.length) | 0],
@@ -471,11 +537,10 @@ function update(dt) {
       f.life -= dt * 0.6; f.y -= 40 * dt;
       if (f.life <= 0) game.floaters.splice(i, 1);
     }
-    if (game.practice.jumped && game.practice.punched && !game.practice.doneAt) {
-      game.practice.doneAt = game.t + 1.5;
-      sfx.level();
+    if (game.practice.doneAt && game.t > game.practice.doneAt) {
+      finishCalibration();
+      beginCountdown();
     }
-    if (game.practice.doneAt && game.t > game.practice.doneAt) beginCountdown();
     return;
   }
 
@@ -607,8 +672,8 @@ function draw() {
   ctx.beginPath(); ctx.arc(830, 80, 44, 0, 7); ctx.fill();
 
   // parallax hills & clouds
-  drawHills(0.25, '#79c96e', 60);
-  drawHills(0.45, '#5bb452', 30);
+  drawHills(0.25, '#b2e3ab', 60);
+  drawHills(0.45, '#93d68c', 30);
   drawClouds();
 
   // ground
@@ -624,30 +689,42 @@ function draw() {
   // holes (draw over ground)
   for (const e of game.entities) {
     if (e.type !== 'hole') continue;
-    ctx.fillStyle = '#1a0f08';
+    ctx.fillStyle = '#120a05';
     ctx.fillRect(e.x, GROUND_Y, e.w, H - GROUND_Y);
-    ctx.strokeStyle = '#3d2410'; ctx.lineWidth = 4;
-    ctx.strokeRect(e.x + 2, GROUND_Y, e.w - 4, H - GROUND_Y);
-    // warning grass tufts
-    ctx.font = '18px sans-serif';
-    ctx.fillText('⚠️', e.x + e.w / 2 - 10, GROUND_Y - 6);
+    // bright red rim on both edges so the gap pops
+    ctx.fillStyle = '#ff4b3a';
+    ctx.fillRect(e.x - 5, GROUND_Y, 7, 20);
+    ctx.fillRect(e.x + e.w - 2, GROUND_Y, 7, 20);
+    ctx.textAlign = 'center';
+    ctx.font = '30px sans-serif';
+    ctx.fillText('⚠️', e.x + e.w / 2, GROUND_Y - 10);
   }
 
-  // obstacles & enemies
+  // obstacles & enemies — big, glowing, with ground shadows
   ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
   for (const e of game.entities) {
+    if (e.type === 'hole') continue;
+    ctx.fillStyle = 'rgba(0,0,0,.22)';
+    ctx.beginPath(); ctx.ellipse(e.x + e.w / 2, GROUND_Y + 5, e.w * 0.6, 7, 0, 0, 7); ctx.fill();
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,255,255,.95)';
+    ctx.shadowBlur = 16;
     if (e.type === 'obstacle') {
-      ctx.font = `${Math.floor(e.h * 1.15)}px sans-serif`;
+      ctx.font = `${Math.floor(e.h * 1.35)}px sans-serif`;
       ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2);
-    } else if (e.type === 'enemy') {
+      ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2);   // second pass doubles the glow
+    } else {
       const bob = Math.sin(game.t * 9 + e.bob) * 4;
-      ctx.font = `${Math.floor(e.h * 1.1)}px sans-serif`;
+      ctx.font = `${Math.floor(e.h * 1.25)}px sans-serif`;
       ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2 + bob);
-      // angry stomp dust
-      if (game.state === 'play') {
-        ctx.fillStyle = 'rgba(140,100,60,.4)';
-        ctx.beginPath(); ctx.arc(e.x + e.w / 2 + 20, GROUND_Y - 3, 5 + Math.abs(bob), 0, 7); ctx.fill();
-      }
+      ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2 + bob);
+    }
+    ctx.restore();
+    // angry stomp dust
+    if (e.type === 'enemy' && game.state === 'play') {
+      const bob = Math.sin(game.t * 9 + e.bob) * 4;
+      ctx.fillStyle = 'rgba(140,100,60,.4)';
+      ctx.beginPath(); ctx.arc(e.x + e.w / 2 + 22, GROUND_Y - 3, 5 + Math.abs(bob), 0, 7); ctx.fill();
     }
   }
 
@@ -886,22 +963,21 @@ function drawScreens() {
       bigText('YOU\'RE READY! 🎉', 92);
       midText('Here we go…', 150);
     } else {
-      bigText('Warm up! 💪', 74);
-      ctx.font = 'bold 30px "Comic Sans MS", sans-serif';
-      ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.lineWidth = 6;
-      const j = `${game.practice.jumped ? '✅' : '⬜'} 🦘 Do a JUMP!`;
-      const p = `${game.practice.punched ? '✅' : '⬜'} 👊 Do a PUNCH!`;
-      ctx.fillStyle = game.practice.jumped ? '#7CFC00' : '#fff';
-      ctx.strokeText(j, W / 2 - 165, 128); ctx.fillText(j, W / 2 - 165, 128);
-      ctx.fillStyle = game.practice.punched ? '#7CFC00' : '#fff';
-      ctx.strokeText(p, W / 2 + 165, 128); ctx.fillText(p, W / 2 + 165, 128);
+      const pr = game.practice;
+      const jumpPhase = pr.phase === 'jump';
+      bigText(jumpPhase ? 'Do 3 BIG jumps! 🦘' : 'Now 3 BIG punches! 👊', 74);
+      // star meter fills as moves are detected
+      ctx.font = '46px sans-serif';
+      let stars = '';
+      for (let i = 0; i < 3; i++) stars += i < pr.count ? '⭐' : '▫️';
+      ctx.fillText(stars, W / 2, 136);
       ctx.font = 'bold 18px "Comic Sans MS", sans-serif';
       ctx.fillStyle = 'rgba(255,255,255,.85)';
       const hint = game.usingCamera
-        ? 'Jump and punch for real — the camera is watching you! 👉'
+        ? 'Make them BIG — the camera is learning your moves! 👉'
         : 'Space = jump, P = punch';
-      ctx.lineWidth = 4;
-      ctx.strokeText(hint, W / 2, 166); ctx.fillText(hint, W / 2, 166);
+      ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,.55)';
+      ctx.strokeText(hint, W / 2, 168); ctx.fillText(hint, W / 2, 168);
     }
   } else if (game.state === 'countdown') {
     const remain = Math.max(game.countdownEnd - game.t, 0);
@@ -961,7 +1037,7 @@ function loop(t) {
 requestAnimationFrame(loop);
 
 // debug/test hook (harmless in production)
-window.__jpr = { game, player, gesture, update, draw, doJump, doPunch, beginCountdown, beginPractice, score };
+window.__jpr = { game, player, gesture, update, draw, doJump, doPunch, beginCountdown, beginPractice, finishCalibration, score };
 
 /* ---------------- Boot flow ---------------- */
 document.getElementById('startBtn').addEventListener('click', async () => {

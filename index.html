@@ -182,8 +182,8 @@ const gesture = {
   cfg: { ...DEFAULT_CFG },
   calib: null,           // { mode, win, jumpSamples, punchSamples } while calibrating
   // internals
-  baseline: null, jumpArmed: true, prevHipY: null, upVel: 0,
-  prevWrists: null, prevT: 0, wristSpeed: { l: 0, r: 0 },
+  baseline: null, jumpArmed: true, prevHipY: null, upVel: 0, lastJumpT: 0,
+  prevRel: null, prevT: 0, wristSpeed: { l: 0, r: 0 },
   extArmed: { l: true, r: true }, lastPunchT: 0,
 };
 
@@ -222,30 +222,39 @@ function updateGestures(lm, tNow) {
       (liftT > cfg.lift || (gesture.upVel > cfg.jumpVel && liftT > cfg.lift * 0.45))) {
     gesture.jumpEvent = true;
     gesture.jumpArmed = false;
+    gesture.lastJumpT = tNow;
     if (gesture.calib && gesture.calib.mode === 'jump' && !gesture.calib.win) {
       gesture.calib.win = { type: 'jump', until: tNow + 800, peakLift: liftT, peakVel: gesture.upVel };
     }
   }
   if (!gesture.jumpArmed && liftT < Math.min(0.1, cfg.lift * 0.5)) gesture.jumpArmed = true;
 
-  /* --- PUNCH: fast wrist snap OR arm thrown out to the side --- */
+  /* --- PUNCH: fast wrist motion RELATIVE to the body, so whole-body
+         motion (jumps!) doesn't read as a punch. Also fully suppressed
+         while airborne or just after a jump. --- */
   const shoulderW = Math.max(Math.abs(ls.x - rs.x), torso * 0.55);
-  const wrists = { l: { x: lw.x, y: lw.y, v: vis(lw) }, r: { x: rw.x, y: rw.y, v: vis(rw) } };
-  if (gesture.prevWrists) {
+  const airborne = liftT > 0.12 || Math.abs(gesture.upVel) > 1.0 || tNow - gesture.lastJumpT < 600;
+  // wrist positions relative to the shoulder midpoint
+  const rel = {
+    l: { x: lw.x - shoulder.x, y: lw.y - shoulder.y, v: vis(lw) },
+    r: { x: rw.x - shoulder.x, y: rw.y - shoulder.y, v: vis(rw) },
+  };
+  if (gesture.prevRel) {
     for (const side of ['l', 'r']) {
-      const w = wrists[side], pw = gesture.prevWrists[side];
+      const w = rel[side], pw = gesture.prevRel[side];
+      const aw = side === 'l' ? lw : rw;                          // absolute wrist
       const sLm = side === 'l' ? ls : rs;
       if (w.v < 0.4) { gesture.wristSpeed[side] = 0; continue; }
-      // smoothed wrist speed, in torso-lengths per second
-      const sp = dist2d(w, pw) / Math.max(dt, 0.01) / torso;
+      // smoothed body-relative wrist speed, in torso-lengths per second
+      const sp = Math.hypot(w.x - pw.x, w.y - pw.y) / Math.max(dt, 0.01) / torso;
       gesture.wristSpeed[side] = gesture.wristSpeed[side] * 0.5 + sp * 0.5;
-      const ext = Math.abs(w.x - sLm.x) / shoulderW;             // lateral arm extension
-      const nearShoulderLevel = Math.abs(w.y - sLm.y) < torso * 1.0;
-      const aboveHips = w.y < hip.y + torso * 0.2;
+      const ext = Math.abs(aw.x - sLm.x) / shoulderW;             // lateral arm extension
+      const nearShoulderLevel = Math.abs(aw.y - sLm.y) < torso * 1.0;
+      const aboveHips = aw.y < hip.y + torso * 0.2;
       const cooled = tNow - gesture.lastPunchT > 300;
       const fastSnap = gesture.wristSpeed[side] > cfg.punchSpeed && aboveHips;
       const armOut = ext > cfg.ext && nearShoulderLevel && gesture.extArmed[side];
-      if (cooled && (fastSnap || armOut)) {
+      if (cooled && !airborne && (fastSnap || armOut)) {
         gesture.punchEvent = true;
         gesture.lastPunchT = tNow;
         gesture.extArmed[side] = false;
@@ -256,7 +265,7 @@ function updateGestures(lm, tNow) {
       if (ext < 0.8) gesture.extArmed[side] = true;
     }
   }
-  gesture.prevWrists = wrists;
+  gesture.prevRel = rel;
 
   // calibration: record how BIG this player's moves actually are
   const c = gesture.calib;
@@ -396,6 +405,7 @@ function doJump() {
       floater(PLAYER_X + 30, player.y - 120, `JUMP ${pr.count}/3 ✅`, '#7CFC00');
       if (pr.count >= 3) {
         pr.phase = 'punch'; pr.count = 0;
+        pr.graceUntil = game.t + 1.0;   // let the last jump's motion settle
         if (gesture.calib) gesture.calib.mode = 'punch';
         sfx.level();
       }
@@ -410,7 +420,8 @@ function doPunch() {
   sfx.punch();
   game.flash.punch = game.t + 0.35;
   spawnParticles(PLAYER_X + 70, player.y - 55, '#ffd944', 6);
-  if (game.state === 'practice' && !game.practice.doneAt && game.practice.phase === 'punch') {
+  if (game.state === 'practice' && !game.practice.doneAt && game.practice.phase === 'punch' &&
+      game.t > (game.practice.graceUntil || 0)) {
     const pr = game.practice;
     pr.count++;
     floater(PLAYER_X + 60, player.y - 90, `PUNCH ${pr.count}/3 ✅`, '#ffd944');
@@ -700,31 +711,31 @@ function draw() {
     ctx.fillText('⚠️', e.x + e.w / 2, GROUND_Y - 10);
   }
 
-  // obstacles & enemies — big, glowing, with ground shadows
-  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  // obstacles & enemies — opaque badge discs so they pop from the background
+  // red ring = punch it, orange ring = jump it
+  ctx.textAlign = 'center';
   for (const e of game.entities) {
     if (e.type === 'hole') continue;
-    ctx.fillStyle = 'rgba(0,0,0,.22)';
-    ctx.beginPath(); ctx.ellipse(e.x + e.w / 2, GROUND_Y + 5, e.w * 0.6, 7, 0, 0, 7); ctx.fill();
+    const cx = e.x + e.w / 2;
+    ctx.fillStyle = 'rgba(0,0,0,.25)';
+    ctx.beginPath(); ctx.ellipse(cx, GROUND_Y + 5, e.w * 0.6, 7, 0, 0, 7); ctx.fill();
+    const bob = e.type === 'enemy' ? Math.sin(game.t * 9 + e.bob) * 4 : 0;
+    const cy = GROUND_Y - e.h * 0.52 - 4 + bob;
+    const r = e.h * 0.72;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fill();
+    ctx.strokeStyle = e.type === 'enemy' ? '#ff3b30' : '#ff9f1c';
+    ctx.lineWidth = 5;
+    ctx.stroke();
     ctx.save();
-    ctx.shadowColor = 'rgba(255,255,255,.95)';
-    ctx.shadowBlur = 16;
-    if (e.type === 'obstacle') {
-      ctx.font = `${Math.floor(e.h * 1.35)}px sans-serif`;
-      ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2);
-      ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2);   // second pass doubles the glow
-    } else {
-      const bob = Math.sin(game.t * 9 + e.bob) * 4;
-      ctx.font = `${Math.floor(e.h * 1.25)}px sans-serif`;
-      ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2 + bob);
-      ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2 + bob);
-    }
+    ctx.textBaseline = 'middle';
+    ctx.font = `${Math.floor(e.h * 1.05)}px sans-serif`;
+    ctx.fillText(e.face, cx, cy + r * 0.08);
     ctx.restore();
     // angry stomp dust
     if (e.type === 'enemy' && game.state === 'play') {
-      const bob = Math.sin(game.t * 9 + e.bob) * 4;
       ctx.fillStyle = 'rgba(140,100,60,.4)';
-      ctx.beginPath(); ctx.arc(e.x + e.w / 2 + 22, GROUND_Y - 3, 5 + Math.abs(bob), 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + 22, GROUND_Y - 3, 5 + Math.abs(bob), 0, 7); ctx.fill();
     }
   }
 

@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Jump Punch Run!</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #1a1040;
+    overflow: hidden;
+    font-family: "Comic Sans MS", "Chalkboard SE", "Segoe UI", sans-serif;
+    touch-action: none;
+  }
+  #stage {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #game {
+    background: #87ceeb;
+    box-shadow: 0 0 60px rgba(0,0,0,.6);
+    border-radius: 12px;
+    max-width: 100%; max-height: 100%;
+  }
+  #overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    text-align: center; color: white;
+    pointer-events: none;
+  }
+  #overlay .panel {
+    pointer-events: auto;
+    background: rgba(20, 10, 60, 0.88);
+    border: 4px solid #ffd944;
+    border-radius: 24px;
+    padding: 34px 44px;
+    max-width: 640px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  }
+  h1 {
+    font-size: clamp(34px, 6vw, 58px);
+    color: #ffd944;
+    text-shadow: 3px 3px 0 #e0501e, 6px 6px 0 rgba(0,0,0,.35);
+    margin-bottom: 12px;
+    letter-spacing: 1px;
+  }
+  .sub { font-size: clamp(15px, 2.4vw, 20px); line-height: 1.55; margin-bottom: 8px; }
+  .how {
+    display: flex; gap: 18px; justify-content: center; margin: 18px 0 22px;
+    flex-wrap: wrap;
+  }
+  .how div {
+    background: rgba(255,255,255,.12);
+    border-radius: 16px; padding: 14px 18px; font-size: 16px;
+    min-width: 150px;
+  }
+  .how .big { font-size: 42px; display: block; margin-bottom: 6px; }
+  button {
+    font-family: inherit;
+    font-size: 24px; font-weight: bold;
+    color: #3a1a00;
+    background: linear-gradient(#ffe066, #ffb300);
+    border: none; border-radius: 50px;
+    padding: 16px 46px;
+    cursor: pointer;
+    box-shadow: 0 6px 0 #b36b00, 0 10px 18px rgba(0,0,0,.4);
+    transition: transform .08s;
+  }
+  button:hover { transform: scale(1.05); }
+  button:active { transform: translateY(4px); box-shadow: 0 2px 0 #b36b00; }
+  .tiny { font-size: 13px; opacity: .75; margin-top: 14px; }
+  #err { color: #ff9b9b; font-size: 15px; margin-top: 12px; display: none; }
+  .hidden { display: none !important; }
+  #spin {
+    width: 54px; height: 54px; margin: 18px auto 6px;
+    border: 6px solid rgba(255,255,255,.25);
+    border-top-color: #ffd944;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  video { display: none; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="game" width="960" height="540"></canvas></div>
+<video id="cam" playsinline muted></video>
+
+<div id="overlay">
+  <div class="panel" id="titlePanel">
+    <h1>🏃 JUMP PUNCH RUN! 🥊</h1>
+    <div class="sub">A webcam game! Your body is the controller.</div>
+    <div class="how">
+      <div><span class="big">🦘</span><b>JUMP</b><br>for real to hop over rocks &amp; holes</div>
+      <div><span class="big">👊</span><b>PUNCH</b><br>the air to smash monsters</div>
+      <div><span class="big">📺</span><b>STAND BACK</b><br>so the camera sees your head &amp; hips</div>
+    </div>
+    <button id="startBtn">▶ START</button>
+    <div class="tiny">Uses your camera to see your moves — video never leaves your device.<br>
+    (Keyboard works too: <b>Space</b> = jump, <b>P</b> = punch)</div>
+    <div id="err"></div>
+  </div>
+  <div class="panel hidden" id="loadPanel">
+    <h1>Getting ready…</h1>
+    <div class="sub" id="loadMsg">Turning on the camera magic 🪄</div>
+    <div id="spin"></div>
+  </div>
+</div>
+
+<script type="module">
+/* ============================================================
+   JUMP PUNCH RUN — webcam motion-controlled endless runner
+   Pose tracking: MediaPipe Tasks Vision (runs 100% in-browser)
+   ============================================================ */
+
+const W = 960, H = 540;
+const GROUND_Y = 460;
+const PLAYER_X = 170;
+const GRAVITY = 2400;
+const JUMP_V = 950;
+const PX_PER_M = 40;
+
+const cvs = document.getElementById('game');
+const ctx = cvs.getContext('2d');
+const video = document.getElementById('cam');
+const overlay = document.getElementById('overlay');
+const titlePanel = document.getElementById('titlePanel');
+const loadPanel = document.getElementById('loadPanel');
+const loadMsg = document.getElementById('loadMsg');
+const errBox = document.getElementById('err');
+
+function fitCanvas() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cvs.style.width = (W * s) + 'px';
+  cvs.style.height = (H * s) + 'px';
+}
+addEventListener('resize', fitCanvas); fitCanvas();
+
+/* ---------------- Sound (tiny synth, no assets) ---------------- */
+let AC = null;
+function initAudio() { if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)(); }
+function tone(freq0, freq1, dur, type = 'sine', vol = 0.25) {
+  if (!AC) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq0, AC.currentTime);
+  o.frequency.exponentialRampToValueAtTime(Math.max(freq1, 1), AC.currentTime + dur);
+  g.gain.setValueAtTime(vol, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+  o.connect(g).connect(AC.destination);
+  o.start(); o.stop(AC.currentTime + dur);
+}
+function noiseBurst(dur = 0.08, vol = 0.3) {
+  if (!AC) return;
+  const n = AC.sampleRate * dur, buf = AC.createBuffer(1, n, AC.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = AC.createBufferSource(); src.buffer = buf;
+  const g = AC.createGain(); g.gain.value = vol;
+  src.connect(g).connect(AC.destination); src.start();
+}
+const sfx = {
+  jump()  { tone(320, 760, 0.18, 'sine', 0.3); },
+  punch() { tone(160, 70, 0.1, 'square', 0.25); noiseBurst(0.07, 0.2); },
+  pop()   { tone(500, 1300, 0.13, 'triangle', 0.3); noiseBurst(0.05, 0.15); },
+  die()   { tone(420, 70, 0.6, 'sawtooth', 0.3); },
+  tick()  { tone(700, 700, 0.07, 'square', 0.15); },
+  go()    { tone(880, 1320, 0.25, 'square', 0.2); },
+  level() { tone(523, 523, 0.09, 'square', 0.2); setTimeout(() => tone(659, 659, 0.09, 'square', 0.2), 100); setTimeout(() => tone(784, 1046, 0.16, 'square', 0.2), 200); },
+};
+
+/* ---------------- Gesture detection from pose ---------------- */
+const gesture = {
+  present: false,        // is a person visible right now
+  lastSeen: 0,           // performance.now() of last good pose
+  jumpEvent: false,      // one-shot flags, consumed by game
+  punchEvent: false,
+  // internals
+  baseline: null, jumpArmed: true, offGround: 0,
+  prevWrists: null, prevT: 0, wristSpeed: { l: 0, r: 0 },
+  extArmed: { l: true, r: true }, lastPunchT: 0,
+};
+
+function midpt(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
+function dist2d(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+function vis(lm) { return lm.visibility === undefined ? 1 : lm.visibility; }
+
+function updateGestures(lm, tNow) {
+  // landmarks: 0 nose, 11/12 shoulders, 13/14 elbows, 15/16 wrists, 23/24 hips
+  const ls = lm[11], rs = lm[12], lh = lm[23], rh = lm[24];
+  const lw = lm[15], rw = lm[16];
+  const bodyOk = vis(ls) > 0.5 && vis(rs) > 0.5 && vis(lh) > 0.4 && vis(rh) > 0.4;
+  if (!bodyOk) { gesture.present = false; return; }
+  gesture.present = true;
+  gesture.lastSeen = tNow;
+
+  const shoulder = midpt(ls, rs), hip = midpt(lh, rh);
+  const torso = Math.max(dist2d(shoulder, hip), 0.05);
+  const dt = gesture.prevT ? Math.min((tNow - gesture.prevT) / 1000, 0.2) : 0.033;
+  gesture.prevT = tNow;
+
+  /* --- JUMP: hips rise sharply above a slow-moving baseline --- */
+  const hipY = hip.y;
+  if (gesture.baseline === null) gesture.baseline = hipY;
+  const lift = gesture.baseline - hipY;            // + means body moved UP
+  if (lift < 0.15 * torso) {
+    // only track baseline while roughly grounded
+    gesture.baseline += (hipY - gesture.baseline) * Math.min(1, dt * 2.2);
+  }
+  if (gesture.jumpArmed && lift > 0.27 * torso) {
+    gesture.jumpEvent = true;
+    gesture.jumpArmed = false;
+  }
+  if (!gesture.jumpArmed && lift < 0.1 * torso) gesture.jumpArmed = true;
+
+  /* --- PUNCH: fast wrist snap OR arm thrown out to the side --- */
+  const shoulderW = Math.max(Math.abs(ls.x - rs.x), torso * 0.55);
+  const wrists = { l: { x: lw.x, y: lw.y, v: vis(lw) }, r: { x: rw.x, y: rw.y, v: vis(rw) } };
+  if (gesture.prevWrists) {
+    for (const side of ['l', 'r']) {
+      const w = wrists[side], pw = gesture.prevWrists[side];
+      const sLm = side === 'l' ? ls : rs;
+      if (w.v < 0.4) { gesture.wristSpeed[side] = 0; continue; }
+      // smoothed wrist speed, in torso-lengths per second
+      const sp = dist2d(w, pw) / Math.max(dt, 0.01) / torso;
+      gesture.wristSpeed[side] = gesture.wristSpeed[side] * 0.5 + sp * 0.5;
+      const ext = Math.abs(w.x - sLm.x) / shoulderW;             // lateral arm extension
+      const nearShoulderLevel = Math.abs(w.y - sLm.y) < torso * 1.0;
+      const aboveHips = w.y < hip.y + torso * 0.2;
+      const cooled = tNow - gesture.lastPunchT > 350;
+      const fastSnap = gesture.wristSpeed[side] > 3.2 && aboveHips;
+      const armOut = ext > 1.2 && nearShoulderLevel && gesture.extArmed[side];
+      if (cooled && (fastSnap || armOut)) {
+        gesture.punchEvent = true;
+        gesture.lastPunchT = tNow;
+        gesture.extArmed[side] = false;
+      }
+      if (ext < 0.8) gesture.extArmed[side] = true;
+    }
+  }
+  gesture.prevWrists = wrists;
+}
+
+/* ---------------- Pose engine (MediaPipe) ---------------- */
+let landmarker = null;
+let lastVideoTime = -1;
+let latestLandmarks = null;
+
+async function loadPose() {
+  const { FilesetResolver, PoseLandmarker } = await import(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14'
+  );
+  const files = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+  );
+  const opts = (delegate) => ({
+    baseOptions: {
+      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+      delegate,
+    },
+    runningMode: 'VIDEO',
+    numPoses: 1,
+  });
+  try { landmarker = await PoseLandmarker.createFromOptions(files, opts('GPU')); }
+  catch { landmarker = await PoseLandmarker.createFromOptions(files, opts('CPU')); }
+}
+
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+function poseTick() {
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const t = performance.now();
+    try {
+      const res = landmarker.detectForVideo(video, t);
+      latestLandmarks = (res.landmarks && res.landmarks[0]) || null;
+      if (latestLandmarks) updateGestures(latestLandmarks, t);
+      else gesture.present = false;
+    } catch (e) { /* skip bad frame */ }
+  }
+  requestAnimationFrame(poseTick);
+}
+
+/* ---------------- Game state ---------------- */
+const game = {
+  state: 'title',      // title | loading | calibrate | countdown | play | dying | gameover
+  usingCamera: false,
+  t: 0,
+  dist: 0, kills: 0, level: 0,
+  speed: 240,
+  entities: [],
+  particles: [],
+  floaters: [],
+  nextSpawn: 400,
+  countdownEnd: 0,
+  banner: null, bannerEnd: 0,
+  paused: false, pauseSince: 0, resumeAt: 0,
+  graceUntil: 0,
+  deathReason: '',
+  dieAnimT: 0,
+  best: +(localStorage.getItem('jpr-best') || 0),
+  flash: { jump: 0, punch: 0 },
+};
+const player = {
+  y: GROUND_Y, vy: 0, onGround: true,
+  punchUntil: 0, runPhase: 0, falling: false,
+};
+
+function score() { return Math.floor(game.dist / PX_PER_M) + game.kills * 25; }
+function isPunching() { return game.t * 1000 < player.punchUntil; }
+
+function resetRun() {
+  game.dist = 0; game.kills = 0; game.level = 0;
+  game.speed = 240;
+  game.entities = []; game.particles = []; game.floaters = [];
+  game.nextSpawn = 500;
+  game.banner = null;
+  game.paused = false;
+  game.deathReason = '';
+  player.y = GROUND_Y; player.vy = 0; player.onGround = true;
+  player.punchUntil = 0; player.falling = false;
+}
+
+function doJump() {
+  if (game.state === 'play' && player.onGround && !player.falling) {
+    player.vy = -JUMP_V;
+    player.onGround = false;
+    sfx.jump();
+    game.flash.jump = game.t + 0.35;
+  } else if (game.state === 'gameover') {
+    beginCountdown();
+  }
+}
+function doPunch() {
+  if (game.state !== 'play' || player.falling) return;
+  player.punchUntil = game.t * 1000 + 500;
+  sfx.punch();
+  game.flash.punch = game.t + 0.35;
+  spawnParticles(PLAYER_X + 70, player.y - 55, '#ffd944', 6);
+}
+
+addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); doJump(); }
+  if (e.code === 'KeyP' || e.code === 'KeyX') doPunch();
+});
+
+/* ---------------- Spawning & difficulty ---------------- */
+const ENEMY_FACES = ['👾', '👹', '🤖', '😈', '🐗'];
+const OBSTACLE_FACES = ['🪨', '📦', '🌵'];
+
+function levelFor(dist) { return Math.floor(dist / PX_PER_M / 120); }
+
+function spawn() {
+  const lvl = game.level;
+  const r = Math.random();
+  // early game: mostly easy obstacles; later: more enemies & holes
+  const enemyP = Math.min(0.2 + lvl * 0.07, 0.45);
+  const holeP = Math.min(0.22 + lvl * 0.03, 0.32);
+  let x = W + 80;
+  if (r < enemyP) {
+    const n = lvl >= 3 && Math.random() < 0.35 ? 2 : 1;   // enemy pairs at higher levels
+    for (let i = 0; i < n; i++) {
+      game.entities.push({
+        type: 'enemy', x: x + i * 95, w: 52, h: 56,
+        face: ENEMY_FACES[(Math.random() * ENEMY_FACES.length) | 0],
+        vx: 40 + lvl * 12 + Math.random() * 20, bob: Math.random() * 6,
+      });
+    }
+  } else if (r < enemyP + holeP) {
+    const w = Math.min(68 + lvl * 9 + Math.random() * 32, 160);
+    game.entities.push({ type: 'hole', x, w });
+  } else {
+    const h = Math.min(32 + Math.random() * 22 + lvl * 4, 78);
+    game.entities.push({
+      type: 'obstacle', x, w: 46 + Math.random() * 16, h,
+      face: OBSTACLE_FACES[(Math.random() * OBSTACLE_FACES.length) | 0],
+    });
+  }
+  game.nextSpawn = Math.max(280, 400 + Math.random() * 260 - lvl * 18) + game.speed * 0.25;
+}
+
+/* ---------------- Particles & floaters ---------------- */
+function spawnParticles(x, y, color, n = 10) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 80 + Math.random() * 220;
+    game.particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 120, life: 0.6, color });
+  }
+}
+function floater(x, y, text, color = '#fff') {
+  game.floaters.push({ x, y, text, color, life: 1 });
+}
+
+/* ---------------- Death ---------------- */
+function die(reason) {
+  if (game.state !== 'play') return;
+  game.state = 'dying';
+  game.dieAnimT = 0;
+  game.deathReason = reason;
+  sfx.die();
+  spawnParticles(PLAYER_X, player.y - 40, '#ff6b6b', 16);
+}
+
+function beginCountdown() {
+  resetRun();
+  game.state = 'countdown';
+  game.countdownEnd = game.t + 3.2;
+}
+
+/* ---------------- Update ---------------- */
+function update(dt) {
+  game.t += dt;
+
+  // consume gesture events
+  if (gesture.jumpEvent) { gesture.jumpEvent = false; doJump(); }
+  if (gesture.punchEvent) { gesture.punchEvent = false; doPunch(); }
+
+  if (game.state === 'calibrate') {
+    if (game.usingCamera && gesture.present && performance.now() - gesture.lastSeen < 300) {
+      beginCountdown();
+    }
+    return;
+  }
+
+  if (game.state === 'countdown') {
+    const remain = game.countdownEnd - game.t;
+    if (remain <= 0) {
+      game.state = 'play';
+      game.graceUntil = game.t + 1.2;
+      sfx.go();
+    }
+    return;
+  }
+
+  if (game.state === 'dying') {
+    game.dieAnimT += dt;
+    player.y += player.falling ? 260 * dt : Math.sin(game.dieAnimT * 10) * 2;
+    if (game.dieAnimT > 1.1) {
+      game.state = 'gameover';
+      const s = score();
+      if (s > game.best) { game.best = s; localStorage.setItem('jpr-best', s); }
+    }
+    return;
+  }
+
+  if (game.state !== 'play') return;
+
+  // pause when the player leaves the camera view
+  if (game.usingCamera) {
+    const gone = performance.now() - gesture.lastSeen > 900;
+    if (!game.paused && gone) { game.paused = true; }
+    if (game.paused) {
+      if (!gone && gesture.present) {
+        game.paused = false;
+        game.graceUntil = game.t + 1.0;
+      } else return;
+    }
+  }
+
+  // world scroll & difficulty
+  game.dist += game.speed * dt;
+  const lvl = levelFor(game.dist);
+  if (lvl > game.level) {
+    game.level = lvl;
+    game.speed = Math.min(240 + lvl * 35, 620);
+    game.banner = `⚡ LEVEL ${lvl + 1} — FASTER! ⚡`;
+    game.bannerEnd = game.t + 1.8;
+    sfx.level();
+  }
+
+  // player physics
+  if (!player.onGround) {
+    player.vy += GRAVITY * dt;
+    player.y += player.vy * dt;
+    if (player.y >= GROUND_Y) { player.y = GROUND_Y; player.vy = 0; player.onGround = true; }
+  }
+  player.runPhase += dt * (8 + game.speed / 60);
+
+  // spawn
+  game.nextSpawn -= game.speed * dt;
+  if (game.nextSpawn <= 0) spawn();
+
+  // entities
+  const punching = isPunching();
+  const pRect = { x: PLAYER_X - 20, y: player.y - 78, w: 40, h: 78 };
+  const punchRect = { x: PLAYER_X + 15, y: player.y - 85, w: 85, h: 60 };
+  const grace = game.t < game.graceUntil;
+
+  for (let i = game.entities.length - 1; i >= 0; i--) {
+    const e = game.entities[i];
+    e.x -= game.speed * dt;
+    if (e.type === 'enemy') e.x -= e.vx * dt;
+    if (e.x + (e.w || 100) < -60) { game.entities.splice(i, 1); continue; }
+
+    if (e.type === 'hole') {
+      if (player.onGround && !grace &&
+          PLAYER_X > e.x + 14 && PLAYER_X < e.x + e.w - 14) {
+        player.falling = true;
+        die('You fell in a hole! 🕳️');
+      }
+    } else {
+      const r = { x: e.x, y: GROUND_Y - e.h, w: e.w, h: e.h };
+      const hitPlayer = rectsOverlap(pRect, r);
+      if (e.type === 'enemy') {
+        const inPunchRange = punching && rectsOverlap(punchRect, r);
+        if (inPunchRange || (hitPlayer && punching)) {
+          game.entities.splice(i, 1);
+          game.kills++;
+          sfx.pop();
+          spawnParticles(e.x + e.w / 2, GROUND_Y - e.h / 2, '#7CFC00', 12);
+          floater(e.x, GROUND_Y - e.h - 20, 'POW! +25', '#ffd944');
+          continue;
+        }
+        if (hitPlayer && !grace) die(`A monster got you! ${e.face}`);
+      } else if (hitPlayer && !grace) {
+        die(`You crashed into a ${e.face}!`);
+      }
+    }
+  }
+
+  // particles / floaters
+  for (let i = game.particles.length - 1; i >= 0; i--) {
+    const p = game.particles[i];
+    p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt;
+    if (p.life <= 0) game.particles.splice(i, 1);
+  }
+  for (let i = game.floaters.length - 1; i >= 0; i--) {
+    const f = game.floaters[i];
+    f.life -= dt; f.y -= 50 * dt; f.x -= game.speed * dt * 0.5;
+    if (f.life <= 0) game.floaters.splice(i, 1);
+  }
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+/* ---------------- Rendering ---------------- */
+function draw() {
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#5ec8f2');
+  sky.addColorStop(0.7, '#aee7ff');
+  sky.addColorStop(1, '#d8f6ff');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+
+  // sun
+  ctx.fillStyle = '#ffe985';
+  ctx.beginPath(); ctx.arc(830, 80, 44, 0, 7); ctx.fill();
+
+  // parallax hills & clouds
+  drawHills(0.25, '#79c96e', 60);
+  drawHills(0.45, '#5bb452', 30);
+  drawClouds();
+
+  // ground
+  ctx.fillStyle = '#8b5a2b';
+  ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+  ctx.fillStyle = '#61b74a';
+  ctx.fillRect(0, GROUND_Y, W, 14);
+  // ground stripes for speed feel
+  ctx.fillStyle = 'rgba(255,255,255,.14)';
+  const off = -(game.dist % 90);
+  for (let x = off; x < W; x += 90) ctx.fillRect(x, GROUND_Y + 30, 44, 6);
+
+  // holes (draw over ground)
+  for (const e of game.entities) {
+    if (e.type !== 'hole') continue;
+    ctx.fillStyle = '#1a0f08';
+    ctx.fillRect(e.x, GROUND_Y, e.w, H - GROUND_Y);
+    ctx.strokeStyle = '#3d2410'; ctx.lineWidth = 4;
+    ctx.strokeRect(e.x + 2, GROUND_Y, e.w - 4, H - GROUND_Y);
+    // warning grass tufts
+    ctx.font = '18px sans-serif';
+    ctx.fillText('⚠️', e.x + e.w / 2 - 10, GROUND_Y - 6);
+  }
+
+  // obstacles & enemies
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  for (const e of game.entities) {
+    if (e.type === 'obstacle') {
+      ctx.font = `${Math.floor(e.h * 1.15)}px sans-serif`;
+      ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2);
+    } else if (e.type === 'enemy') {
+      const bob = Math.sin(game.t * 9 + e.bob) * 4;
+      ctx.font = `${Math.floor(e.h * 1.1)}px sans-serif`;
+      ctx.fillText(e.face, e.x + e.w / 2, GROUND_Y - 2 + bob);
+      // angry stomp dust
+      if (game.state === 'play') {
+        ctx.fillStyle = 'rgba(140,100,60,.4)';
+        ctx.beginPath(); ctx.arc(e.x + e.w / 2 + 20, GROUND_Y - 3, 5 + Math.abs(bob), 0, 7); ctx.fill();
+      }
+    }
+  }
+
+  drawPlayer();
+
+  // particles
+  for (const p of game.particles) {
+    ctx.globalAlpha = Math.max(p.life / 0.6, 0);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // floaters
+  for (const f of game.floaters) {
+    ctx.globalAlpha = Math.max(f.life, 0);
+    ctx.font = 'bold 26px "Comic Sans MS", sans-serif';
+    ctx.fillStyle = f.color;
+    ctx.strokeStyle = 'rgba(0,0,0,.5)'; ctx.lineWidth = 4;
+    ctx.strokeText(f.text, f.x, f.y);
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+
+  drawHUD();
+  drawPreview();
+  drawScreens();
+}
+
+function drawHills(speedMul, color, extra) {
+  ctx.fillStyle = color;
+  const offset = (game.dist * speedMul) % 400;
+  for (let i = -1; i < 4; i++) {
+    const cx = i * 400 - offset + 200;
+    ctx.beginPath();
+    ctx.arc(cx, GROUND_Y + 60, 150 + extra, Math.PI, 0);
+    ctx.fill();
+  }
+}
+function drawClouds() {
+  ctx.fillStyle = 'rgba(255,255,255,.9)';
+  const off = (game.dist * 0.12) % 1100;
+  const clouds = [[100, 80], [420, 130], [760, 60], [1000, 110]];
+  for (const [bx, by] of clouds) {
+    const x = ((bx - off) % 1100 + 1100) % 1100 - 70;
+    ctx.beginPath();
+    ctx.arc(x, by, 26, 0, 7); ctx.arc(x + 28, by - 10, 30, 0, 7); ctx.arc(x + 58, by, 24, 0, 7);
+    ctx.fill();
+  }
+}
+
+function drawPlayer() {
+  const x = PLAYER_X, footY = player.y;
+  const punching = isPunching();
+  const dead = game.state === 'dying';
+  ctx.save();
+  ctx.translate(x, footY);
+  if (dead) ctx.rotate(Math.min(game.dieAnimT * 3, Math.PI / 2));
+
+  const legSwing = player.onGround && !dead ? Math.sin(player.runPhase) : 0.3;
+
+  // legs
+  ctx.strokeStyle = '#2b4bd7'; ctx.lineWidth = 9; ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, -34); ctx.lineTo(-10 + legSwing * 14, -14 + Math.abs(legSwing) * -3); ctx.lineTo(-8 + legSwing * 18, 0);
+  ctx.moveTo(0, -34); ctx.lineTo(10 - legSwing * 14, -14); ctx.lineTo(12 - legSwing * 18, 0);
+  ctx.stroke();
+  // shoes
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.ellipse(-8 + legSwing * 18, 0, 10, 5, 0, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(12 - legSwing * 18, 0, 10, 5, 0, 0, 7); ctx.fill();
+
+  // body
+  ctx.fillStyle = '#e0501e';
+  roundRect(-16, -66, 32, 36, 10); ctx.fill();
+  // lightning bolt on chest
+  ctx.fillStyle = '#ffd944';
+  ctx.font = '18px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('⚡', 0, -40);
+
+  // arms
+  ctx.strokeStyle = '#e0501e'; ctx.lineWidth = 8;
+  if (punching) {
+    // punching arm out front + fist
+    ctx.beginPath(); ctx.moveTo(6, -58); ctx.lineTo(46, -60); ctx.stroke();
+    ctx.fillStyle = '#ffcc99';
+    ctx.beginPath(); ctx.arc(54, -60, 11, 0, 7); ctx.fill();
+    // impact star
+    ctx.fillStyle = '#ffd944'; ctx.font = '26px sans-serif';
+    ctx.fillText('💥', 78, -52);
+    ctx.strokeStyle = '#e0501e';
+    ctx.beginPath(); ctx.moveTo(-6, -58); ctx.lineTo(-20, -44); ctx.stroke();
+  } else {
+    const armSwing = Math.sin(player.runPhase + Math.PI) * 10;
+    ctx.beginPath();
+    ctx.moveTo(6, -58); ctx.lineTo(18 + armSwing * 0.5, -42);
+    ctx.moveTo(-6, -58); ctx.lineTo(-18 - armSwing * 0.5, -42);
+    ctx.stroke();
+  }
+
+  // head
+  ctx.fillStyle = '#ffcc99';
+  ctx.beginPath(); ctx.arc(0, -82, 15, 0, 7); ctx.fill();
+  // hair
+  ctx.fillStyle = '#5a3410';
+  ctx.beginPath(); ctx.arc(0, -87, 14, Math.PI, 0); ctx.fill();
+  // face
+  ctx.fillStyle = '#222';
+  const eyeY = -84;
+  ctx.beginPath(); ctx.arc(4, eyeY, 2.4, 0, 7); ctx.arc(11, eyeY, 2.4, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(7, -78, 5, 0.2, Math.PI - 0.4); ctx.stroke();
+
+  ctx.restore();
+
+  // jump dust
+  if (!player.onGround && player.vy < 0) {
+    ctx.fillStyle = 'rgba(200,200,200,.5)';
+    ctx.beginPath(); ctx.arc(x - 6, GROUND_Y - 4, 8, 0, 7); ctx.arc(x + 10, GROUND_Y - 2, 6, 0, 7); ctx.fill();
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawHUD() {
+  if (game.state === 'title' || game.state === 'loading') return;
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 34px "Comic Sans MS", sans-serif';
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(0,0,0,.45)'; ctx.lineWidth = 6;
+  const s = `⭐ ${score()}`;
+  ctx.strokeText(s, 24, 48); ctx.fillText(s, 24, 48);
+  ctx.font = 'bold 20px "Comic Sans MS", sans-serif';
+  const b = `Best: ${game.best}   Level ${game.level + 1}`;
+  ctx.strokeText(b, 24, 78); ctx.fillText(b, 24, 78);
+
+  // gesture flash icons
+  ctx.textAlign = 'center';
+  ctx.font = '40px sans-serif';
+  if (game.t < game.flash.jump) ctx.fillText('🦘', W / 2 - 40, 60);
+  if (game.t < game.flash.punch) ctx.fillText('👊', W / 2 + 40, 60);
+
+  // banner
+  if (game.banner && game.t < game.bannerEnd) {
+    ctx.font = 'bold 40px "Comic Sans MS", sans-serif';
+    ctx.fillStyle = '#ffd944'; ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.lineWidth = 8;
+    ctx.strokeText(game.banner, W / 2, 150);
+    ctx.fillText(game.banner, W / 2, 150);
+  }
+}
+
+/* webcam preview w/ skeleton, bottom-right */
+const PV_W = 176, PV_H = 132;
+function drawPreview() {
+  if (!game.usingCamera || video.readyState < 2) return;
+  const px = W - PV_W - 14, py = H - PV_H - 14;
+  ctx.save();
+  // border flashes with detected moves
+  let border = '#fff';
+  if (game.t < game.flash.jump) border = '#39e639';
+  else if (game.t < game.flash.punch) border = '#ffb300';
+  else if (!gesture.present) border = '#ff5252';
+  ctx.strokeStyle = border; ctx.lineWidth = 4;
+  roundRect(px - 2, py - 2, PV_W + 4, PV_H + 4, 10); ctx.stroke();
+  roundRect(px, py, PV_W, PV_H, 8); ctx.clip();
+  // mirrored video
+  ctx.translate(px + PV_W, py); ctx.scale(-1, 1);
+  ctx.drawImage(video, 0, 0, PV_W, PV_H);
+  // landmarks
+  if (latestLandmarks) {
+    ctx.fillStyle = '#39e639';
+    for (const i of [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]) {
+      const lm = latestLandmarks[i];
+      if (lm && vis(lm) > 0.4) {
+        ctx.beginPath(); ctx.arc(lm.x * PV_W, lm.y * PV_H, 3, 0, 7); ctx.fill();
+      }
+    }
+  }
+  ctx.restore();
+  if (!gesture.present) {
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 13px sans-serif'; ctx.fillStyle = '#ff5252';
+    ctx.fillText('Can\'t see you!', px + PV_W / 2, py - 8);
+  }
+}
+
+/* full-screen state messages drawn on canvas */
+function drawScreens() {
+  ctx.textAlign = 'center';
+  if (game.state === 'calibrate') {
+    dimBox();
+    bigText('📸 Stand back!', H / 2 - 40);
+    midText('Move back until the camera can see', H / 2 + 10);
+    midText('your head AND your hips 🙆', H / 2 + 44);
+    if (!game.usingCamera) midText('(or press Space to start with keyboard)', H / 2 + 90);
+  } else if (game.state === 'countdown') {
+    const remain = Math.max(game.countdownEnd - game.t, 0);
+    const n = Math.ceil(remain);
+    dimBox();
+    if (remain > 0.15) {
+      ctx.font = 'bold 130px "Comic Sans MS", sans-serif';
+      ctx.fillStyle = '#ffd944'; ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 12;
+      const label = n > 3 ? 'Ready?' : String(n);
+      ctx.strokeText(label, W / 2, H / 2 + 30);
+      ctx.fillText(label, W / 2, H / 2 + 30);
+      if (game._lastCount !== n) { game._lastCount = n; sfx.tick(); }
+    }
+  } else if (game.state === 'play' && game.paused) {
+    dimBox();
+    bigText('👀 Where did you go?', H / 2 - 20);
+    midText('Step back in front of the camera to keep playing!', H / 2 + 30);
+  } else if (game.state === 'play' && game.t < game.graceUntil) {
+    ctx.font = 'bold 44px "Comic Sans MS", sans-serif';
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(0,0,0,.5)'; ctx.lineWidth = 8;
+    ctx.strokeText('GO! 🏃', W / 2, 200); ctx.fillText('GO! 🏃', W / 2, 200);
+  } else if (game.state === 'gameover') {
+    dimBox();
+    bigText('💫 GAME OVER 💫', H / 2 - 90);
+    midText(game.deathReason, H / 2 - 40);
+    ctx.font = 'bold 46px "Comic Sans MS", sans-serif';
+    ctx.fillStyle = '#ffd944'; ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 9;
+    const sc = `⭐ Score: ${score()}`;
+    ctx.strokeText(sc, W / 2, H / 2 + 20); ctx.fillText(sc, W / 2, H / 2 + 20);
+    if (score() >= game.best && score() > 0) midText('🏆 NEW BEST! 🏆', H / 2 + 62, '#7CFC00');
+    else midText(`Best: ${game.best}`, H / 2 + 62);
+    const blink = Math.sin(game.t * 4) > -0.3;
+    if (blink) midText(game.usingCamera ? '🦘 JUMP to play again!' : 'Press Space to play again!', H / 2 + 115, '#fff');
+  }
+}
+function dimBox() { ctx.fillStyle = 'rgba(10,5,40,.55)'; ctx.fillRect(0, 0, W, H); }
+function bigText(t, y) {
+  ctx.font = 'bold 52px "Comic Sans MS", sans-serif';
+  ctx.fillStyle = '#ffd944'; ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 10;
+  ctx.strokeText(t, W / 2, y); ctx.fillText(t, W / 2, y);
+}
+function midText(t, y, color = '#fff') {
+  ctx.font = 'bold 26px "Comic Sans MS", sans-serif';
+  ctx.fillStyle = color; ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.lineWidth = 6;
+  ctx.strokeText(t, W / 2, y); ctx.fillText(t, W / 2, y);
+}
+
+/* ---------------- Main loop ---------------- */
+let lastT = 0;
+function loop(t) {
+  const dt = Math.min((t - lastT) / 1000, 0.05);
+  lastT = t;
+  if (game.state !== 'title' && game.state !== 'loading') update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// debug/test hook (harmless in production)
+window.__jpr = { game, player, gesture, update, draw, doJump, doPunch, beginCountdown, score };
+
+/* ---------------- Boot flow ---------------- */
+document.getElementById('startBtn').addEventListener('click', async () => {
+  initAudio();
+  titlePanel.classList.add('hidden');
+  loadPanel.classList.remove('hidden');
+  game.state = 'loading';
+  try {
+    loadMsg.textContent = 'Turning on the camera… say cheese! 📸';
+    await startCamera();
+    loadMsg.textContent = 'Teaching the computer to see you… 🤖';
+    await loadPose();
+    game.usingCamera = true;
+    poseTick();
+  } catch (e) {
+    console.warn('Camera/pose unavailable:', e);
+    game.usingCamera = false;
+  }
+  loadPanel.classList.add('hidden');
+  overlay.style.display = 'none';
+  if (game.usingCamera) {
+    game.state = 'calibrate';
+  } else {
+    // keyboard fallback — still fully playable
+    game.state = 'calibrate';
+    setTimeout(() => { if (game.state === 'calibrate') beginCountdown(); }, 2500);
+  }
+});
+</script>
+</body>
+</html>

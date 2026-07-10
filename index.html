@@ -118,8 +118,8 @@
 const W = 960, H = 540;
 const GROUND_Y = 460;
 const PLAYER_X = 170;
-const GRAVITY = 2400;
-const JUMP_V = 950;
+const GRAVITY = 2200;
+const JUMP_V = 1000;
 const PX_PER_M = 40;
 
 const cvs = document.getElementById('game');
@@ -359,7 +359,7 @@ const game = {
   usingCamera: false,
   t: 0,
   dist: 0, kills: 0, level: 0,
-  speed: 240,
+  speed: 280,
   entities: [],
   particles: [],
   floaters: [],
@@ -383,7 +383,7 @@ function isPunching() { return game.t * 1000 < player.punchUntil; }
 
 function resetRun() {
   game.dist = 0; game.kills = 0; game.level = 0;
-  game.speed = 240;
+  game.speed = 280;
   game.entities = []; game.particles = []; game.floaters = [];
   game.nextSpawn = 500;
   game.banner = null;
@@ -595,7 +595,7 @@ function update(dt) {
   const lvl = levelFor(game.dist);
   if (lvl > game.level) {
     game.level = lvl;
-    game.speed = Math.min(240 + lvl * 35, 620);
+    game.speed = Math.min(280 + lvl * 35, 650);
     game.banner = `⚡ LEVEL ${lvl + 1} — FASTER! ⚡`;
     game.bannerEnd = game.t + 1.8;
     sfx.level();
